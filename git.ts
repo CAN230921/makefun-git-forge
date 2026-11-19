@@ -2,11 +2,22 @@ import { isOid, ObjectStore, packObjects, readCommit, readTree, unpack, ZERO, ty
 
 const flush = Buffer.from('0000');
 const delimiter = Buffer.from('0001');
-const packet = (data: Buffer | string) => {
-  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  return Buffer.concat([Buffer.from((bytes.length + 4).toString(16).padStart(4, '0')), bytes]);
+const packet = (line: string) => {
+  const size = Buffer.byteLength(line) + 4;
+  const frame = Buffer.allocUnsafe(size);
+  frame.write(size.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  frame.write(line, 4);
+  return frame;
 };
 const packets = (lines: string[]) => lines.map(packet);
+const v2Advertisement = Buffer.concat([
+  ...packets(['version 2\n', 'agent=forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n']),
+  flush,
+]);
+const packfile = packet('packfile\n');
+const unpackOk = packet('unpack ok\n');
+const unpackInvalid = packet('unpack invalid pack\n');
+const tags = 'refs/tags/';
 
 function readPackets(body: Buffer, stopAtFlush = false) {
   const lines: string[] = [];
@@ -55,13 +66,23 @@ export class GitRepository {
   store = new ObjectStore();
   refs = new Map<string, string>();
   defaultBranch: string;
-  cachedFetch?: { key: string; body: Buffer };
+  private cachedFetch?: { request: Buffer; response: Buffer };
+  private cachedRefs?: { request: Buffer; response: Buffer };
+  private advertised = new Map<string, Buffer>();
 
   constructor(defaultBranch = 'main') {
     this.defaultBranch = defaultBranch;
   }
 
   get head() { return 'refs/heads/' + this.defaultBranch; }
+
+  setRef(ref: string, oid?: string) {
+    if (this.refs.get(ref) === oid) return;
+    if (oid) this.refs.set(ref, oid);
+    else this.refs.delete(ref);
+    this.cachedRefs = undefined;
+    this.advertised.clear();
+  }
 
   resolve(ref = this.defaultBranch): string | undefined {
     return this.refs.get(ref) ?? this.refs.get('refs/heads/' + ref)
@@ -84,15 +105,21 @@ export class GitRepository {
   }
 
   isAncestor(ancestor: string, tip: string, extra: Map<string, GitObject>): boolean {
-    const pending = [tip];
+    if (tip === ancestor) return true;
+    const parents = (oid: string) => {
+      const object = extra.get(oid);
+      return object?.kind === 'commit' ? readCommit(object.bytes).parents : this.parents(oid);
+    };
+    const directParents = parents(tip);
+    if (directParents.includes(ancestor)) return true;
+    const pending = [...directParents];
     const seen = new Set<string>();
     while (pending.length) {
       const oid = pending.pop()!;
       if (oid === ancestor) return true;
       if (seen.has(oid)) continue;
       seen.add(oid);
-      const object = extra.get(oid);
-      pending.push(...(object?.kind === 'commit' ? readCommit(object.bytes).parents : this.parents(oid)));
+      pending.push(...parents(oid));
     }
     return false;
   }
@@ -118,9 +145,9 @@ export class GitRepository {
   }
 
   advertise(service: string, v2: boolean): Buffer {
-    if (v2 && service === 'git-upload-pack') {
-      return Buffer.concat([...packets(['version 2\n', 'agent=forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n']), flush]);
-    }
+    if (v2 && service === 'git-upload-pack') return v2Advertisement;
+    const cached = this.advertised.get(service);
+    if (cached) return cached;
     const write = service === 'git-receive-pack';
     const caps = write
       ? 'report-status delete-refs side-band-64k ofs-delta object-format=sha1 agent=forge/1.0'
@@ -131,11 +158,13 @@ export class GitRepository {
     if (!lines.length && write) lines.push(['capabilities^{}', ZERO]);
     const output = lines.flatMap(([name, oid], index) => {
       const line = oid + ' ' + name + (index === 0 ? '\0' + caps : '') + '\n';
+      if (write || !name.startsWith(tags)) return [line];
       const peeled = this.peel(oid);
-      return name.startsWith('refs/tags/') && peeled !== oid && !write
-        ? [line, peeled + ' ' + name + '^{}\n'] : [line];
+      return peeled === oid ? [line] : [line, peeled + ' ' + name + '^{}\n'];
     });
-    return Buffer.concat([packet('# service=' + service + '\n'), flush, ...packets(output), flush]);
+    const response = Buffer.concat([packet('# service=' + service + '\n'), flush, ...packets(output), flush]);
+    if (response.length <= 1024 * 1024) this.advertised.set(service, response);
+    return response;
   }
 
   listRefs(args: string[]): Buffer {
@@ -207,8 +236,16 @@ export class GitRepository {
   }
 
   upload(body: Buffer, v2: boolean): Buffer {
+    if (v2 && body.length <= 4096) {
+      if (this.cachedFetch?.request.equals(body)) return this.cachedFetch.response;
+      if (this.cachedRefs?.request.equals(body)) return this.cachedRefs.response;
+    }
     const { lines } = readPackets(body);
-    if (v2 && lines.includes('command=ls-refs')) return this.listRefs(lines);
+    if (v2 && lines.includes('command=ls-refs')) {
+      const response = this.listRefs(lines);
+      if (body.length <= 4096 && response.length <= 1024 * 1024) this.cachedRefs = { request: body, response };
+      return response;
+    }
     if (v2 && !lines.includes('command=fetch')) throw new Error('unknown git command');
     const args = (name: string) => lines.filter((line) => line.startsWith(name + ' ')).map((line) => line.slice(name.length + 1));
     const wants = args('want').map((line) => line.split(' ')[0]);
@@ -228,8 +265,7 @@ export class GitRepository {
       return Buffer.concat([...acknowledgments, flush]);
     }
     const relative = depth !== Infinity && lines.includes('deepen-relative') && oldShallow.size > 0;
-    const cacheKey = !haves.length && !oldShallow.size && v2 && depth === 1 && done ? wants.join(' ') : null;
-    if (cacheKey && this.cachedFetch?.key === cacheKey) return this.cachedFetch.body;
+    const cacheable = !haves.length && !oldShallow.size && v2 && depth === 1 && done && body.length <= 4096;
     const { selected, shallow } = this.reach(wants, depth, relative || depth === Infinity ? oldShallow : new Set(), relative);
     const held = haves.length ? this.reach(haves, Infinity, oldShallow).selected : new Set<string>();
     const boundaries = [
@@ -242,13 +278,13 @@ export class GitRepository {
     if (v2) {
       const sections = boundaries.length ? [packet('shallow-info\n'), ...packets(boundaries), delimiter] : [];
       const negotiation = acknowledgments.length ? [...acknowledgments, packet('ready\n'), delimiter] : [];
-      result = Buffer.concat([...negotiation, ...sections, packet('packfile\n'), ...sideband(pack), flush]);
+      result = Buffer.concat([...negotiation, ...sections, packfile, ...sideband(pack), flush]);
     } else {
       const prefix = [...packets(boundaries), ...(depth !== Infinity ? [flush] : []), packet('NAK\n')];
       const useBand = /\bside-band(?:-64k)?\b/.test(wantsLine);
       result = Buffer.concat(useBand ? [...prefix, ...sideband(pack), flush] : [...prefix, pack]);
     }
-    if (cacheKey && result.length <= 4 * 1024 * 1024) this.cachedFetch = { key: cacheKey, body: result };
+    if (cacheable && result.length <= 4 * 1024 * 1024) this.cachedFetch = { request: body, response: result };
     return result;
   }
 
@@ -286,7 +322,7 @@ export class GitRepository {
       if (!isOid(oldOid ?? '') || !isOid(newOid ?? '') || !validRef(ref ?? '')) throw new Error('invalid push command');
       return { oldOid, newOid, ref };
     });
-    const report: string[] = [];
+    const report: Buffer[] = [];
     let extra = new Map<string, GitObject>();
     let unpackError = false;
     if (offset < body.length || commands.some((cmd) => cmd.newOid !== ZERO)) {
@@ -299,7 +335,7 @@ export class GitRepository {
         unpackError = true;
       }
     }
-    report.push(unpackError ? 'unpack invalid pack\n' : 'unpack ok\n');
+    report.push(unpackError ? unpackInvalid : unpackOk);
     const accepted = new Set<string>();
     for (const { oldOid, newOid, ref } of commands) {
       let reason = '';
@@ -319,17 +355,16 @@ export class GitRepository {
         }
       }
       if (reason) {
-        report.push('ng ' + ref + ' ' + reason + '\n');
+        report.push(packet('ng ' + ref + ' ' + reason + '\n'));
       } else {
-        if (newOid === ZERO) this.refs.delete(ref);
-        else this.refs.set(ref, newOid);
+        this.setRef(ref, newOid === ZERO ? undefined : newOid);
         if (reachable) for (const oid of reachable) accepted.add(oid);
-        report.push('ok ' + ref + '\n');
+        report.push(packet('ok ' + ref + '\n'));
       }
     }
     for (const oid of accepted) this.store.set(oid, extra.get(oid)!);
     if (!capabilities.includes('report-status') && !capabilities.includes('report-status-v2')) return flush;
-    const stream = Buffer.concat([...packets(report), flush]);
+    const stream = Buffer.concat([...report, flush]);
     return capabilities.includes('side-band-64k') ? Buffer.concat([...sideband(stream), flush]) : stream;
   }
 }

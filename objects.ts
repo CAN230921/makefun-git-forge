@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, hash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 export const ZERO = '0'.repeat(40);
@@ -10,10 +10,13 @@ export type Kind = 'commit' | 'tree' | 'blob' | 'tag';
 export type GitObject = { kind: Kind; bytes: Buffer; compressed?: Buffer };
 export type TreeEntry = { name: string; mode: string; oid: string };
 const kinds = [null, 'commit', 'tree', 'blob', 'tag'] as const;
-const digest = (bytes: Buffer) => createHash('sha1').update(bytes).digest();
+const digest = (bytes: Buffer) => hash('sha1', bytes, 'buffer');
 
 export function objectId(kind: Kind, bytes: Buffer): string {
-  return createHash('sha1').update(kind + ' ' + bytes.length + '\0').update(bytes).digest('hex');
+  const header = kind + ' ' + bytes.length + '\0';
+  // Small objects benefit from a single hash call. Stream larger ones to avoid copying their bytes.
+  if (bytes.length <= 1536) return hash('sha1', Buffer.concat([Buffer.from(header), bytes]), 'hex');
+  return createHash('sha1').update(header).update(bytes).digest('hex');
 }
 
 export function readCommit(bytes: Buffer) {

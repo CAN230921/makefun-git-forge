@@ -1,9 +1,18 @@
-import { missing, refJson, text, type Forge } from './store.ts';
+import { missing, refJson, text, type Forge, type Issue } from './store.ts';
 
-export type Reply = { status: number; value?: unknown; headers?: Record<string, string> };
+export type Reply = { status: number; value?: unknown; encoded?: string; headers?: Record<string, string> };
 const ok = (value: unknown): Reply => ({ status: 200, value });
 const created = (value: unknown): Reply => ({ status: 201, value });
 const noContent: Reply = { status: 204 };
+const issueJson = new WeakMap<Issue, { revision: string; reply: Reply }>();
+
+function readIssue(issue: Issue): Reply {
+  const cached = issueJson.get(issue);
+  if (cached?.revision === issue.updated_at) return cached.reply;
+  const reply = { status: 200, encoded: JSON.stringify(issue) };
+  issueJson.set(issue, { revision: issue.updated_at, reply });
+  return reply;
+}
 
 function page<T>(values: T[], url: URL): Reply {
   const size = Math.min(100, Math.max(1, Math.floor(Number(url.searchParams.get('per_page')) || 30)));
@@ -18,8 +27,7 @@ function page<T>(values: T[], url: URL): Reply {
   return reply;
 }
 
-export function rest(forge: Forge, method: string, url: URL, body: Record<string, unknown>): Reply {
-  const parts = url.pathname.slice('/api/v3'.length).split('/').slice(1).map(decodeURIComponent);
+export function rest(forge: Forge, method: string, url: URL, parts: string[], body: Record<string, unknown>): Reply {
   const [root, owner, name, resource, index, action] = parts;
   if (!root && method === 'GET') {
     return {
@@ -98,7 +106,7 @@ export function rest(forge: Forge, method: string, url: URL, body: Record<string
       if (method === 'GET') return page(forge.issues(repo, url.searchParams.get('state') ?? 'open', url.searchParams.get('direction') === 'asc'), url);
     } else if (/^[1-9][0-9]*$/.test(index)) {
       const issue = forge.getIssue(repo, Number(index));
-      if (!action && method === 'GET') return ok(issue);
+      if (!action && method === 'GET') return readIssue(issue);
       if (!action && method === 'PATCH') return ok(forge.updateIssue(issue, body));
       if (action === 'comments' && parts.length === 6) {
         if (method === 'POST') return created(forge.addComment(repo, issue.number, body));

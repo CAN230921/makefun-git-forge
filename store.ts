@@ -106,7 +106,7 @@ export class Repository extends GitRepository {
     const contents = 'tree ' + tree + '\n' + (parent ? 'parent ' + parent + '\n' : '')
       + 'author ' + identity + '\ncommitter ' + identity + '\n\n' + message + '\n';
     const oid = this.store.put('commit', Buffer.from(contents));
-    this.refs.set(branchRef(branch), oid);
+    this.setRef(branchRef(branch), oid);
     return oid;
   }
 
@@ -385,7 +385,7 @@ export class Forge {
     const sha = text(input.sha);
     if (!validRef(ref) || !isOid(sha) || repo.refs.has(ref) || !repo.store.objects.has(sha)
       || (ref.startsWith('refs/heads/') && !repo.store.commit(sha))) return invalid('Invalid or existing ref');
-    repo.refs.set(ref, sha);
+    repo.setRef(ref, sha);
     return refJson(ref, sha);
   }
 }
