@@ -10,10 +10,16 @@ Restarting the process clears its repositories and metadata.
 
 ## Run locally
 
-Use Node.js 22. The server has no external dependencies.
+The server is written in Go and uses only the standard library. Use Go 1.26.4
+to build or run it on your development machine.
 
 ```sh
-FORGE_TOKEN=local-demo-token FORGE_OWNER=local FORGE_PORT=3000 node main.ts
+GO111MODULE=off FORGE_TOKEN=local-demo-token FORGE_OWNER=local FORGE_PORT=3000 go run .
+```
+
+In another terminal, create and clone a repository.
+
+```sh
 curl -X POST http://127.0.0.1:3000/api/v3/user/repos \
   -H 'Authorization: Bearer local-demo-token' \
   -H 'Content-Type: application/json' \
@@ -27,6 +33,10 @@ GraphQL at `/api/graphql`, MCP at `/mcp`, and the unauthenticated health check
 at `/healthz`.
 
 ## Bounty runner
+
+Node.js 22 starts the checked-in static Linux amd64 binary through
+`main.ts`. The launcher replaces itself with the Go process.
+Run `sh build-linux.sh` to rebuild the binary with Go 1.26.4.
 
 When the grader supplies `MAKEFUN_ENV_URL` and `MAKEFUN_SHOP_TOKEN`, the
 server binds an ephemeral port, registers with the grader, and exits after the
