@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -49,7 +50,7 @@ type gitRepo struct {
 	objects               map[oid]*gitObject
 	bytes                 int
 	advertisement         []byte
-	refsCache, fetchCache uploadCache
+	refsCache, fetchCache atomic.Pointer[uploadCache]
 }
 
 func (g *gitRepo) advertise() []byte {
@@ -404,7 +405,7 @@ func (g *gitRepo) updateRef(cmd refCommand, staged map[oid]*gitObject) string {
 	if cmd.next == zeroID {
 		delete(g.refs, cmd.ref)
 		g.advertisement = nil
-		g.refsCache = uploadCache{}
+		g.refsCache.Store(nil)
 		return ""
 	}
 	if cmd.next == current {
@@ -443,7 +444,7 @@ func (g *gitRepo) updateRef(cmd refCommand, staged map[oid]*gitObject) string {
 	}
 	g.refs[cmd.ref] = cmd.next
 	g.advertisement = nil
-	g.refsCache = uploadCache{}
+	g.refsCache.Store(nil)
 	return ""
 }
 
@@ -462,7 +463,14 @@ func (f *forge) serveGit(w http.ResponseWriter, r *http.Request) {
 	advertise := path == "info/refs" && r.Method == http.MethodGet
 	service := path
 	if advertise {
-		service = r.URL.Query().Get("service")
+		switch r.URL.RawQuery {
+		case "service=git-upload-pack":
+			service = "git-upload-pack"
+		case "service=git-receive-pack":
+			service = "git-receive-pack"
+		default:
+			service = r.URL.Query().Get("service")
+		}
 	}
 	if !found || !repoPath || (service != "git-receive-pack" && service != "git-upload-pack") ||
 		(!advertise && r.Method != http.MethodPost) {
@@ -481,14 +489,8 @@ func (f *forge) serveGit(w http.ResponseWriter, r *http.Request) {
 		if service == "git-upload-pack" {
 			limit = maxFetchRequest
 		}
-		var release func()
-		var err error
-		if service == "git-receive-pack" {
-			body, release, err = readGitBody(w, r, limit)
-			defer release()
-		} else {
-			body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-		}
+		data, release, err := readGitBody(w, r, limit)
+		defer release()
 		if err != nil {
 			var cap *http.MaxBytesError
 			if errors.As(err, &cap) {
@@ -498,6 +500,7 @@ func (f *forge) serveGit(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		body = data
 	}
 	f.mu.RLock()
 	target := f.repos[strings.ToLower(repo)]
@@ -509,7 +512,13 @@ func (f *forge) serveGit(w http.ResponseWriter, r *http.Request) {
 	var out []byte
 	var err error
 	if service == "git-upload-pack" {
-		v2 := slices.Contains(strings.Split(r.Header.Get("Git-Protocol"), ":"), "version=2")
+		v2 := false
+		for parameter := range strings.SplitSeq(r.Header.Get("Git-Protocol"), ":") {
+			if parameter == "version=2" {
+				v2 = true
+				break
+			}
+		}
 		head := "refs/heads/" + target.Branch
 		if advertise {
 			out = target.git.advertiseUpload(head, v2)
@@ -524,6 +533,10 @@ func (f *forge) serveGit(w http.ResponseWriter, r *http.Request) {
 	f.mu.RUnlock()
 	if err != nil {
 		problem(w, http.StatusBadRequest, "Malformed Git request")
+		return
+	}
+	if wire, ok := w.(*wireResponse); ok {
+		wire.writeGit(out, service, advertise)
 		return
 	}
 	contentType := "application/x-" + service + "-result"

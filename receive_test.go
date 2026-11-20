@@ -81,6 +81,38 @@ func TestRejectInvalidPacks(t *testing.T) {
 func commandLine(old, next oid, ref, suffix string) string {
 	return old.String() + " " + next.String() + " " + ref + suffix + "\n"
 }
+
+func TestUploadCacheOwnsRequestAndRefreshesRefs(t *testing.T) {
+	var repo gitRepo
+	const branch = "refs/heads/main"
+	before := oid{1}
+	after := oid{2}
+	repo.setRef(branch, before)
+
+	request := append(appendPacket(nil, "command=ls-refs\n"), "00010000"...)
+	borrowed := bytes.Clone(request)
+	oldReply, err := repo.upload(borrowed, branch, true)
+	if err != nil || !bytes.Contains(oldReply, []byte(before.String())) {
+		t.Fatalf("initial advertisement: %q, %v", oldReply, err)
+	}
+	clear(borrowed)
+	if cached := repo.cachedUpload(request, branch); !bytes.Equal(cached, oldReply) {
+		t.Fatal("the cache key changed after its request buffer was cleared")
+	}
+	if cached := repo.cachedUpload(request, "refs/heads/alternate"); cached != nil {
+		t.Fatal("the cache hit with a different HEAD")
+	}
+
+	repo.setRef(branch, after)
+	reply, err := repo.upload(request, branch, true)
+	if err != nil || !bytes.Contains(reply, []byte(after.String())) || bytes.Contains(reply, []byte(before.String())) {
+		t.Fatalf("updated advertisement: %q, %v", reply, err)
+	}
+	if !bytes.Contains(oldReply, []byte(before.String())) {
+		t.Fatal("ref changes modified an earlier response")
+	}
+}
+
 func TestReceiveRefs(t *testing.T) {
 	tree := &gitObject{kind: treeKind}
 	treeID := tree.id()

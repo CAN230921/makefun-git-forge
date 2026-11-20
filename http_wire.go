@@ -164,6 +164,38 @@ func (w *wireResponse) writeIssue(data []byte, requestID uint64) {
 	_, _ = out.Write(data)
 }
 
+func (w *wireResponse) writeGit(data []byte, service string, advertise bool) {
+	w.started = true
+	if w.body != nil && !w.body.done {
+		w.close = true
+	}
+	out := w.writer
+	if w.request.ProtoMinor == 0 {
+		_, _ = out.WriteString("HTTP/1.0 200 OK\r\n")
+	} else {
+		_, _ = out.WriteString("HTTP/1.1 200 OK\r\n")
+	}
+	_, _ = out.WriteString("Content-Type: application/x-")
+	_, _ = out.WriteString(service)
+	if advertise {
+		_, _ = out.WriteString("-advertisement")
+	} else {
+		_, _ = out.WriteString("-result")
+	}
+	_, _ = out.WriteString("\r\nCache-Control: no-cache\r\nContent-Length: ")
+	var digits [24]byte
+	_, _ = out.Write(strconv.AppendInt(digits[:0], int64(len(data)), 10))
+	_, _ = out.WriteString("\r\n")
+	_, _ = out.WriteString(responseDate())
+	if w.close {
+		_, _ = out.WriteString("Connection: close\r\n")
+	} else if w.request.ProtoMinor == 0 {
+		_, _ = out.WriteString("Connection: keep-alive\r\n")
+	}
+	_, _ = out.WriteString("\r\n")
+	_, _ = out.Write(data)
+}
+
 func (w *wireResponse) Write(data []byte) (int, error) {
 	if !w.started {
 		w.WriteHeader(200)

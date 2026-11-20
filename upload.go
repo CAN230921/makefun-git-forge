@@ -24,6 +24,7 @@ var uploadV2 = func() []byte {
 }()
 
 type uploadCache struct {
+	head    string
 	request []byte
 	reply   []byte
 }
@@ -364,19 +365,34 @@ func (g *gitRepo) fetch(q fetchQuery, v2 bool) ([]byte, error) {
 		return nil, err
 	}
 	if v2 || q.band {
-		return append(reply, frameReport(pack)...), nil
+		return appendSideband(reply, pack), nil
 	}
 	return append(reply, pack...), nil
 }
 
+// Request buffers may return to the HTTP pool after upload. A published
+// cache entry owns its key and its immutable response.
+func (g *gitRepo) cachedUpload(body []byte, head string) []byte {
+	for _, cache := range [...]*uploadCache{g.fetchCache.Load(), g.refsCache.Load()} {
+		if cache != nil && cache.head == head && bytes.Equal(cache.request, body) {
+			return cache.reply
+		}
+	}
+	return nil
+}
+
 func (g *gitRepo) upload(body []byte, head string, v2 bool) ([]byte, error) {
+	cacheable := v2 && len(body) <= 4096
+	if cacheable {
+		if reply := g.cachedUpload(body, head); reply != nil {
+			return reply, nil
+		}
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if v2 && len(body) <= 4096 {
-		for _, cache := range []uploadCache{g.fetchCache, g.refsCache} {
-			if cache.request != nil && bytes.Equal(cache.request, body) {
-				return cache.reply, nil
-			}
+	if cacheable {
+		if reply := g.cachedUpload(body, head); reply != nil {
+			return reply, nil
 		}
 	}
 	lines, err := readUploadLines(body)
@@ -387,8 +403,8 @@ func (g *gitRepo) upload(body []byte, head string, v2 bool) ([]byte, error) {
 		switch {
 		case slices.Contains(lines, "command=ls-refs"):
 			reply := g.listRefs(head, lines)
-			if len(body) <= 4096 && len(reply) <= maxCachedFetch {
-				g.refsCache = uploadCache{body, reply}
+			if cacheable && len(reply) <= maxCachedFetch {
+				g.refsCache.Store(&uploadCache{head, bytes.Clone(body), reply})
 			}
 			return reply, nil
 		case !slices.Contains(lines, "command=fetch"):
@@ -400,8 +416,8 @@ func (g *gitRepo) upload(body []byte, head string, v2 bool) ([]byte, error) {
 		return nil, err
 	}
 	reply, err := g.fetch(q, v2)
-	if err == nil && v2 && q.done && len(q.haves) == 0 && len(q.shallow) == 0 && len(body) <= 4096 && len(reply) <= maxCachedFetch {
-		g.fetchCache = uploadCache{body, reply}
+	if err == nil && cacheable && q.done && len(q.haves) == 0 && len(q.shallow) == 0 && len(reply) <= maxCachedFetch {
+		g.fetchCache.Store(&uploadCache{head, bytes.Clone(body), reply})
 	}
 	return reply, err
 }

@@ -259,7 +259,7 @@ func (g *gitRepo) setRef(name string, id oid) {
 	}
 	g.refs[name] = id
 	g.advertisement = nil
-	g.refsCache = uploadCache{}
+	g.refsCache.Store(nil)
 }
 func (g *gitRepo) resolve(name string) oid {
 	for _, key := range []string{name, ref(name), "refs/tags/" + name} {
