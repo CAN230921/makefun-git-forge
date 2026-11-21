@@ -10,7 +10,7 @@ fi
 set --
 for source in ./*.go; do
   case "$source" in
-    *_test.go) ;;
+    *_test.go | ./epoll_other.go) ;;
     *) set -- "$@" "${source#./}" ;;
   esac
 done

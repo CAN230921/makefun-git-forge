@@ -175,7 +175,7 @@ func main() {
 	if env != "" {
 		control := make(chan error, 1)
 		go func() { control <- runTrial(env, port); _ = listener.Close(); server.close() }()
-		if err = server.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err = serveExperimental(server, listener); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Fatal(err)
 		}
 		if err = <-control; err != nil {
@@ -183,7 +183,7 @@ func main() {
 		}
 		return
 	}
-	if err = server.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
+	if err = serveExperimental(server, listener); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Fatal(err)
 	}
 }
