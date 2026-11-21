@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -34,6 +35,7 @@ type pollConn struct {
 	reply           wireResponse
 	request         *http.Request
 	headerEnd       int
+	handled         int
 	closeAfterWrite bool
 	peerClosed      bool
 	lastUsed        time.Time
@@ -74,6 +76,7 @@ func serveExperimental(s *wireServer, listener net.Listener) error {
 	}
 	var events [64]syscall.EpollEvent
 	lastSweep := time.Now()
+	var streams atomic.Int32
 	for {
 		count, err := syscall.EpollWait(ep, events[:], 200)
 		if err == syscall.EINTR {
@@ -175,6 +178,16 @@ func serveExperimental(s *wireServer, listener net.Listener) error {
 			if c.output.Len() == 0 && (c.eof || c.peerClosed && len(c.input) == 0) && !c.hasCompleteInput() {
 				closePeer(conn)
 				continue
+			}
+			if c.handled >= 12 && c.output.Len() == 0 && len(c.input) == 0 && !c.peerClosed && !c.closeAfterWrite && streams.Load() < maxStreamPeers {
+				stream, err := newStreamPeer(conn)
+				if err == nil {
+					_ = syscall.EpollCtl(ep, syscall.EPOLL_CTL_DEL, conn, nil)
+					delete(connections, conn)
+					streams.Add(1)
+					s.acceptStream(stream, func() { streams.Add(-1) })
+					continue
+				}
 			}
 			interest := uint32(readInterest)
 			if c.output.Len() > 0 || c.hasCompleteInput() {
@@ -295,6 +308,7 @@ func (c *pollConn) step(s *wireServer) pollStep {
 		return pollClose
 	}
 	c.closeAfterWrite = c.reply.close
+	c.handled++
 	copy(c.input, c.input[end:])
 	c.input = c.input[:len(c.input)-end]
 	c.request = nil
